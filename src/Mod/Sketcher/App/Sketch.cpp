@@ -942,9 +942,21 @@ int Sketch::addArc(const Part::GeomArcOfCircle& circleSegment, bool fixed)
     // store complete set
     Geoms.push_back(def);
 
-    // arcs require an ArcRules constraint for the end points
+    // arcs require an ArcRules constraint for the end points.
+    // ArcRules gradients w.r.t. the angle parameter (u) are ~r while the
+    // L2LAngle constraint (added for Angle constraints) has gradients ~1/r
+    // w.r.t. point coordinates.  Scale ArcRules by 1/sqrt(r) and L2LAngle
+    // by sqrt(r) so both families share the same column norm ~sqrt(r).
     if (!fixed) {
-        GCSsys.addConstraintArcRules(a);
+        const int arcRulesIdx = GCSsys.addConstraintArcRules(a);
+        const double r = *a.rad;
+        if (r > 0.0 && std::isfinite(r)) {
+            const double invSqrtR = 1.0 / std::sqrt(r);
+            GCSsys.rescaleConstraint(arcRulesIdx - 3, invSqrtR);
+            GCSsys.rescaleConstraint(arcRulesIdx - 2, invSqrtR);
+            GCSsys.rescaleConstraint(arcRulesIdx - 1, invSqrtR);
+            GCSsys.rescaleConstraint(arcRulesIdx, invSqrtR);
+        }
     }
 
     if (!fixed) {
@@ -3476,7 +3488,11 @@ int Sketch::addAngleConstraint(int geoId, double* value, bool driving)
         GCS::Arc& a = Arcs[Geoms[geoId].index];
 
         int tag = ++ConstraintsCounter;
-        GCSsys.addConstraintL2LAngle(a.center, a.start, a.center, a.end, value, tag, driving);
+        const int idx = GCSsys.addConstraintL2LAngle(a.center, a.start, a.center, a.end, value, tag, driving);
+        const double r = *a.rad;
+        if (r > 0.0 && std::isfinite(r)) {
+            GCSsys.rescaleConstraint(idx, std::sqrt(r));
+        }
         return ConstraintsCounter;
     }
     return -1;
@@ -4669,7 +4685,7 @@ int Sketch::internalSolve(std::string& solvername, int level)
     }
 
     if (!valid_solution && !isInitMove) {  // Fall back to other solvers
-        for (int soltype = 0; soltype < 4; soltype++) {
+        for (int soltype = 0; soltype < 5; soltype++) {
 
             if (soltype == defaultsoltype) {
                 continue;  // skip default solver
@@ -4688,8 +4704,18 @@ int Sketch::internalSolve(std::string& solvername, int level)
                     solvername = "BFGS";
                     ret = GCSsys.solve(isFine, GCS::BFGS);
                     break;
-                // last resort: augment the system with a second subsystem and use the SQP solver
                 case 3:
+                    // Scale-invariant DogLeg. Reached only when the unscaled
+                    // solvers above have all failed, which happens on
+                    // badly-scaled sketches where length parameters (large arc
+                    // radii, long lines) dwarf the angle parameters they are
+                    // coupled to. Column scaling conditions those cases without
+                    // altering the well-scaled sketches handled above.
+                    solvername = "DogLegScaled";
+                    ret = GCSsys.solve(isFine, GCS::DogLegScaled);
+                    break;
+                // last resort: augment the system with a second subsystem and use the SQP solver
+                case 4:
                     solvername = "SQP(augmented system)";
                     InitParameters.resize(Parameters.size());
                     int i = 0;
@@ -4730,7 +4756,7 @@ int Sketch::internalSolve(std::string& solvername, int level)
                 }
             }
 
-            if (soltype == 3) {  // cleanup temporary constraints of the augmented system
+            if (soltype == 4) {  // cleanup temporary constraints of the augmented system
                 clearTemporaryConstraints();
             }
 
@@ -4744,6 +4770,10 @@ int Sketch::internalSolve(std::string& solvername, int level)
                                         "LevenbergMarquardt solvers have failed.\n");
                 }
                 else if (soltype == 3) {
+                    Base::Console().Log("Important: the scale-invariant DogLeg solver succeeded "
+                                        "where all unscaled solvers have failed.\n");
+                }
+                else if (soltype == 4) {
                     Base::Console().Log("Important: the SQP solver succeeded where all single "
                                         "subsystem solvers have failed.\n");
                 }
